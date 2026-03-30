@@ -1,5 +1,12 @@
 """
-live/paper_trader.py (v3 — multi-underlying, uses LOT_SIZES from config)
+live/paper_trader.py (v5 — Natenberg improvements)
+
+Changes vs v3:
+  - update_trade() now also checks for spot-recross thesis invalidation:
+    if the underlying crosses back through day_open, the directional
+    thesis is broken and we exit immediately (separate from premium SL).
+  - Pending signal state stored in log for 2-bar confirmation (read by scheduler).
+  - SL tightened to 25% (in config).
 """
 
 import json
@@ -10,7 +17,8 @@ from config import (
     CAPITAL, MAX_RISK_PER_TRADE_PCT, DAILY_LOSS_CAP_PCT,
     MAX_TRADES_PER_DAY, STOP_LOSS_PCT, PARTIAL_EXIT_PCT,
     TRAIL_STOP_PCT, TIME_STOP, TRADES_LOG_FILE,
-    LOT_SIZES, UNDERLYING,   # NEW: LOT_SIZES for per-underlying lot rounding
+    LOT_SIZES, UNDERLYING,
+    SIGNAL_CONFIRM_BARS,
 )
 
 
@@ -19,14 +27,16 @@ def load_log():
         with open(TRADES_LOG_FILE, "r") as f:
             return json.load(f)
     return {
-        "capital":       CAPITAL,
-        "available":     CAPITAL,
-        "total_pnl":     0,
-        "trades_today":  0,
-        "daily_loss":    0,
-        "trade_date":    str(datetime.date.today()),
-        "open_trade":    None,
-        "closed_trades": [],
+        "capital":        CAPITAL,
+        "available":      CAPITAL,
+        "total_pnl":      0,
+        "trades_today":   0,
+        "daily_loss":     0,
+        "trade_date":     str(datetime.date.today()),
+        "open_trade":     None,
+        "closed_trades":  [],
+        # 2-bar confirmation state
+        "pending_signal": None,   # dict with direction, symbol, count
     }
 
 
@@ -39,9 +49,10 @@ def save_log(log):
 def reset_daily(log):
     today = str(datetime.date.today())
     if log["trade_date"] != today:
-        log["trade_date"]   = today
-        log["trades_today"] = 0
-        log["daily_loss"]   = 0
+        log["trade_date"]     = today
+        log["trades_today"]   = 0
+        log["daily_loss"]     = 0
+        log["pending_signal"] = None   # reset pending signal at day start
     return log
 
 
@@ -58,10 +69,8 @@ def can_trade(log):
     return True, "✅ OK"
 
 
-# calc_units returns raw units from the 1% risk rule (no lot rounding).
-# This matches what the test suite expects and keeps the maths clean.
-# Lot-size rounding is applied in enter_trade(), where underlying is known.
 def calc_units(premium):
+    """Raw units from 1% risk rule — no lot rounding (test suite expects this)."""
     max_loss = CAPITAL * MAX_RISK_PER_TRADE_PCT
     loss_pu  = premium * STOP_LOSS_PCT
     if loss_pu <= 0:
@@ -70,67 +79,122 @@ def calc_units(premium):
 
 
 def _round_to_lot(units, underlying):
-    """Round raw units DOWN to the nearest whole lot for the given underlying."""
-    lot_size = LOT_SIZES.get(underlying, 75)
+    lot_size = LOT_SIZES.get(underlying, 65)
     lots     = max(1, units // lot_size)
     return lots * lot_size
 
 
-def enter_trade(log, entry):
-    log    = reset_daily(log)
-    action = entry.get("action", "BUY")
+# ── 2-BAR CONFIRMATION ────────────────────────────────────────
 
+def check_and_update_pending(log, result):
+    """
+    Natenberg: wait for confirmation before entering.
+
+    Called by scheduler after each scan.  Returns:
+      "ENTER"   — signal has confirmed for SIGNAL_CONFIRM_BARS bars → enter now
+      "PENDING" — signal fired but not yet confirmed → wait
+      "RESET"   — signal changed or disappeared → clear pending state
+      "NONE"    — no signal this bar and no pending → nothing to do
+
+    The pending state is keyed by (underlying, direction) so a direction
+    flip or underlying change resets the counter.
+    """
+    log = reset_daily(log)
+
+    current_go        = result.get("go", False)
+    current_signal    = result.get("signal", "NO_SIGNAL")
+    current_underlying = result.get("underlying", UNDERLYING)
+    pending           = log.get("pending_signal")
+
+    if not current_go:
+        # No signal — clear any pending state for this underlying
+        if pending and pending.get("underlying") == current_underlying:
+            log["pending_signal"] = None
+            save_log(log)
+            return "RESET", log
+        return "NONE", log
+
+    # Signal is live this bar
+    key = f"{current_underlying}_{current_signal}"
+
+    if pending and pending.get("key") == key:
+        # Same signal as last bar — increment counter
+        pending["count"] += 1
+        log["pending_signal"] = pending
+        save_log(log)
+        if pending["count"] >= SIGNAL_CONFIRM_BARS:
+            return "ENTER", log
+        else:
+            return "PENDING", log
+    else:
+        # New signal or direction changed — start fresh counter
+        log["pending_signal"] = {
+            "key":        key,
+            "underlying": current_underlying,
+            "direction":  current_signal,
+            "count":      1,
+            "entry":      result.get("entry", {}),
+        }
+        save_log(log)
+        return "PENDING", log
+
+
+def enter_trade(log, entry):
+    log        = reset_daily(log)
+    action     = entry.get("action", "BUY")
     underlying = entry.get("underlying", UNDERLYING)
     premium    = entry["ltp"]
-    # Raw 1%-rule units, then rounded to correct lot size for this underlying
     units      = _round_to_lot(calc_units(premium), underlying)
 
     if units == 0:
         return log, "⚠️ Position size = 0"
 
     if action == "BUY":
-        sl_price      = round(premium * (1 - STOP_LOSS_PCT),    2)
-        target_price  = round(premium * (1 + PARTIAL_EXIT_PCT), 2)
-        cost          = round(units   * premium,                 2)
+        sl_price     = round(premium * (1 - STOP_LOSS_PCT),    2)
+        target_price = round(premium * (1 + PARTIAL_EXIT_PCT), 2)
+        cost         = round(units * premium, 2)
         trade = {
-            "id":              f"T{len(log['closed_trades'])+1:03d}",
-            "date":            str(datetime.date.today()),
-            "entry_time":      datetime.datetime.now().strftime("%H:%M:%S"),
-            "symbol":          entry["trading_symbol"],
-            "underlying":      underlying,    # NEW: stored for reference
-            "action":          "BUY",
-            "direction":       entry["direction"],
-            "expiry":          entry["expiry"],
-            "entry_price":     premium,
-            "units":           units,
-            "cost":            cost,
-            "sl_price":        sl_price,
-            "target_price":    target_price,
-            "trailing_sl":     sl_price,
-            "partial_exited":  False,
-            "partial_units":   units // 2,
-            "status":          "OPEN",
-            "exit_price":      None,
-            "exit_time":       None,
-            "exit_reason":     None,
-            "pnl":             0,
+            "id":             f"T{len(log['closed_trades'])+1:03d}",
+            "date":           str(datetime.date.today()),
+            "entry_time":     datetime.datetime.now().strftime("%H:%M:%S"),
+            "symbol":         entry["trading_symbol"],
+            "underlying":     underlying,
+            "action":         "BUY",
+            "direction":      entry["direction"],
+            "expiry":         entry["expiry"],
+            "dte_at_entry":   entry.get("dte", 0),
+            "iv_rank":        entry.get("iv_rank", 50),
+            "day_open":       entry.get("day_open", 0),   # for thesis-invalidation SL
+            "entry_price":    premium,
+            "units":          units,
+            "cost":           cost,
+            "sl_price":       sl_price,
+            "target_price":   target_price,
+            "trailing_sl":    sl_price,
+            "partial_exited": False,
+            "partial_units":  units // 2,
+            "status":         "OPEN",
+            "exit_price":     None,
+            "exit_time":      None,
+            "exit_reason":    None,
+            "pnl":            0,
         }
         log["available"] -= cost
-
-    else:   # SELL_NAKED or SELL_SPREAD
-        spread            = entry.get("spread", {})
-        premium_received  = (spread.get("net_credit", premium)
-                             if action == "SELL_SPREAD" else premium)
-        sl_price          = round(premium_received * 2, 2)   # 2× received = SL
+    else:
+        spread           = entry.get("spread", {})
+        premium_received = (spread.get("net_credit", premium)
+                            if action == "SELL_SPREAD" else premium)
+        sl_price         = round(premium_received * 2, 2)
         trade = {
             "id":              f"T{len(log['closed_trades'])+1:03d}",
             "date":            str(datetime.date.today()),
             "entry_time":      datetime.datetime.now().strftime("%H:%M:%S"),
             "symbol":          entry["trading_symbol"],
-            "underlying":      underlying,    # NEW
+            "underlying":      underlying,
             "action":          action,
             "direction":       entry["direction"],
             "expiry":          entry["expiry"],
+            "day_open":        entry.get("day_open", 0),
             "entry_price":     premium,
             "premium_received": premium_received,
             "units":           units,
@@ -147,30 +211,49 @@ def enter_trade(log, entry):
             "pnl":             0,
         }
 
-    log["open_trade"]    = trade
-    log["trades_today"] += 1
+    log["open_trade"]     = trade
+    log["trades_today"]  += 1
+    log["pending_signal"] = None   # clear pending after entry
     save_log(log)
     return log, trade
 
 
-def update_trade(log, current_price):
+def update_trade(log, current_price, current_spot=None):
+    """
+    current_spot: live spot price of the underlying (optional).
+    If provided, checks thesis-invalidation (spot recrossed day_open).
+    """
     trade = log.get("open_trade")
     if not trade:
         return log, None
 
-    now        = datetime.datetime.now()
-    time_stop  = datetime.datetime.strptime(TIME_STOP, "%H:%M").time()
-    action     = trade.get("action", "BUY")
+    now       = datetime.datetime.now()
+    time_stop = datetime.datetime.strptime(TIME_STOP, "%H:%M").time()
+    action    = trade.get("action", "BUY")
 
     if now.time() >= time_stop:
-        return _close_trade(log, current_price, "⏰ Time stop 2:45 PM")
+        return _close_trade(log, current_price, "⏰ Time stop 14:45")
 
     if action == "BUY":
-        # SL hit
-        if current_price <= trade["sl_price"]:
-            return _close_trade(log, current_price, f"🛑 SL hit ₹{current_price:.2f}")
+        # ── Thesis-invalidation SL (Natenberg: exit when thesis breaks) ──
+        day_open  = trade.get("day_open", 0)
+        direction = trade.get("direction", "")
+        if current_spot and day_open > 0:
+            if direction == "BEARISH" and current_spot > day_open:
+                return _close_trade(log, current_price,
+                                    f"🔄 Thesis invalidated — spot ₹{current_spot:,.0f} "
+                                    f"recrossed above day open ₹{day_open:,.0f}")
+            elif direction == "BULLISH" and current_spot < day_open:
+                return _close_trade(log, current_price,
+                                    f"🔄 Thesis invalidated — spot ₹{current_spot:,.0f} "
+                                    f"recrossed below day open ₹{day_open:,.0f}")
 
-        # Trailing SL
+        # ── Premium SL ────────────────────────────────────────────────────
+        if current_price <= trade["sl_price"]:
+            return _close_trade(log, current_price,
+                                f"🛑 SL hit ₹{current_price:.2f}")
+
+        # ── Trailing SL (after partial exit) ─────────────────────────────
         if trade["partial_exited"]:
             new_trail = round(current_price * (1 - TRAIL_STOP_PCT), 2)
             if new_trail > trade["trailing_sl"]:
@@ -180,7 +263,7 @@ def update_trade(log, current_price):
                 return _close_trade(log, current_price,
                                     f"📉 Trail SL ₹{trade['trailing_sl']:.2f}")
 
-        # Partial exit
+        # ── Partial exit ──────────────────────────────────────────────────
         if not trade["partial_exited"] and current_price >= trade["target_price"]:
             half     = trade["partial_units"]
             part_pnl = round(half * (current_price - trade["entry_price"]), 2)
@@ -195,24 +278,24 @@ def update_trade(log, current_price):
             return log, (f"💰 Partial exit {half} units @ ₹{current_price:.2f} | "
                          f"Locked ₹{part_pnl:.2f} | SL → breakeven")
 
-    else:   # SELL trades — profit when premium decays
+    else:   # SELL trades
         premium_received = trade.get("premium_received", trade["entry_price"])
         if current_price >= trade["sl_price"]:
             return _close_trade(log, current_price,
-                                f"🛑 Sell SL hit — premium at ₹{current_price:.2f}")
+                                f"🛑 Sell SL hit — premium ₹{current_price:.2f}")
         target_exit = round(premium_received * 0.20, 2)
         if current_price <= target_exit:
             return _close_trade(log, current_price,
-                                f"🎯 Target hit — premium decayed to ₹{current_price:.2f}")
+                                f"🎯 Target — premium decayed to ₹{current_price:.2f}")
 
     save_log(log)
     return log, None
 
 
 def _close_trade(log, exit_price, reason):
-    trade    = log["open_trade"]
-    units    = trade["units"]
-    action   = trade.get("action", "BUY")
+    trade  = log["open_trade"]
+    units  = trade["units"]
+    action = trade.get("action", "BUY")
 
     if action == "BUY":
         remaining_pnl = round(units * (exit_price - trade["entry_price"]), 2)
@@ -243,9 +326,9 @@ def get_daily_summary(log):
     trades = [t for t in log["closed_trades"] if t["date"] == today]
     wins   = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
-    day_pnl      = sum(t["pnl"] for t in trades)
-    buy_trades   = [t for t in trades if t.get("action") == "BUY"]
-    sell_trades  = [t for t in trades if t.get("action") in ("SELL_NAKED", "SELL_SPREAD")]
+    day_pnl     = sum(t["pnl"] for t in trades)
+    buy_trades  = [t for t in trades if t.get("action") == "BUY"]
+    sell_trades = [t for t in trades if t.get("action") in ("SELL_NAKED", "SELL_SPREAD")]
 
     lines = [
         f"📊 *Zero Hero Summary — {today}*",
@@ -255,16 +338,21 @@ def get_daily_summary(log):
         f"📈 Total P&L: ₹{log['total_pnl']:+,.2f}",
         f"",
         f"Today: {len(trades)} trades | ✅ {len(wins)} wins | ❌ {len(losses)} losses",
-        f"Buy trades: {len(buy_trades)} | Sell trades: {len(sell_trades)}",
+        f"Buy: {len(buy_trades)} | Sell: {len(sell_trades)}",
         f"Day P&L: ₹{day_pnl:+.2f}",
         f"",
     ]
     for t in trades:
-        icon = "✅" if t["pnl"] > 0 else "❌"
-        act  = t.get("action", "BUY")
-        und  = t.get("underlying", "")
+        icon    = "✅" if t["pnl"] > 0 else "❌"
+        act     = t.get("action", "BUY")
+        und     = t.get("underlying", "")
+        dte     = t.get("dte_at_entry", "?")
+        iv_rank = t.get("iv_rank", "?")
         und_tag = f"[{und}] " if und else ""
-        lines.append(f"{icon} {t['id']} {und_tag}[{act}] {t['symbol']} | "
-                     f"₹{t['entry_price']} → ₹{t.get('exit_price','?')} | "
-                     f"P&L ₹{t['pnl']:+.2f} | {t.get('exit_reason','')}")
+        lines.append(
+            f"{icon} {t['id']} {und_tag}[{act}] {t['symbol']} "
+            f"DTE:{dte} IVRank:{iv_rank}% | "
+            f"₹{t['entry_price']} → ₹{t.get('exit_price','?')} | "
+            f"P&L ₹{t['pnl']:+.2f} | {t.get('exit_reason','')}"
+        )
     return "\n".join(lines)
